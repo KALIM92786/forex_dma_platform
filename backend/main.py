@@ -79,6 +79,7 @@ async def place_order(order: OrderSchema, db: Session = Depends(get_db)):
     if live_rate is None:
         raise HTTPException(status_code=500, detail="Failed to fetch OANDA live rate.")
 
+    # Create and add the new order
     new_order = Order(
         pair=pair_normalized,
         type=order.type.lower(),
@@ -90,41 +91,52 @@ async def place_order(order: OrderSchema, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_order)
 
-    # Simple matching engine logic (FIFO, price tolerance)
+    # Optimize matching engine
     opposite_type = "buy" if new_order.type == "sell" else "sell"
+    price_tolerance = 0.0001
+
+    # Fetch potential matching orders in a single query
     matching_orders = db.query(Order).filter(
         Order.pair == pair_normalized,
         Order.type == opposite_type,
-        Order.status == "pending"
+        Order.status == "pending",
+        abs(Order.price - live_rate) <= price_tolerance
     ).order_by(Order.timestamp.asc()).all()
 
     matched = False
     remaining_amount = new_order.amount
-    price_tolerance = 0.0001
 
+    # Process matching orders
     for match in matching_orders:
-        if abs(live_rate - match.price) <= price_tolerance:
-            match_amount = min(match.amount, remaining_amount)
-            match.amount -= match_amount
-            remaining_amount -= match_amount
-            new_fill = Fill(
-                buy_order_id=match.id if match.type == "buy" else new_order.id,
-                sell_order_id=match.id if match.type == "sell" else new_order.id,
-                pair=pair_normalized,
-                amount=match_amount
-            )
-            db.add(new_fill)
-            if match.amount == 0:
-                match.status = "filled"
-            if remaining_amount == 0:
-                new_order.status = "filled"
-                matched = True
-                break
+        if remaining_amount <= 0:
+            break
 
+        match_amount = min(match.amount, remaining_amount)
+        remaining_amount -= match_amount
+        match.amount -= match_amount
+
+        # Create a new fill record
+        new_fill = Fill(
+            buy_order_id=match.id if match.type == "buy" else new_order.id,
+            sell_order_id=match.id if match.type == "sell" else new_order.id,
+            pair=pair_normalized,
+            amount=match_amount
+        )
+        db.add(new_fill)
+
+        # Update the status of the matched order
+        if match.amount == 0:
+            match.status = "filled"
+
+        # Update the new order status if fully matched
+        if remaining_amount == 0:
+            new_order.status = "filled"
+            matched = True
+
+    # If there is remaining amount, update the new order and keep it pending
     if remaining_amount > 0:
         new_order.amount = remaining_amount
         new_order.status = "pending"
-        db.add(new_order)
 
     db.commit()
     db.refresh(new_order)
